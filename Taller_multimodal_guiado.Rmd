@@ -1,0 +1,690 @@
+---
+title: "Taller 9: integración multimodal en medicina de precisión"
+subtitle: "Bioinformática II | Magíster en Informática Médica | Universidad de Chile"
+author: "Felipe Correa Rodríguez"
+lang: es
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                        fig.width = 8, fig.height = 4.5, dpi = 140,
+                        fig.align = "center")
+}
+options(width = 95)
+set.seed(2026)
+col_wsi <- "#326BA2"
+col_rna <- "#D17A35"
+col_early <- "#208477"
+col_late <- "#795A9B"
+col_models <- c(WSI = col_wsi, RNA = col_rna, Early = col_early, Late = col_late)
+```
+
+**Duración:** 75 minutos de trabajo guiado. Todo el código está resuelto. Analizaremos los bloques en orden y discutiremos sus resultados para enlazar con la clase. Los anexos son complementarios.
+
+**Pregunta:** ¿la combinación de características histológicas y transcriptómicas mejora la predicción de estadio avanzado frente a temprano respecto a cada modalidad por separado?
+
+Trabajaremos con 320 pacientes, inspirados en la estructura de TCGA-COAD. Las características WSI y RNA representan la salida numérica de pipelines anteriores. No se necesita GPU ni entrenar un encoder desde 0, pero seguiremos todo el camino de integración.
+
+| Etapa | Minutos | Objetivo |
+|:---|---:|:---|
+| 1\. Archivos y pareo | 15 | Auditar nombres, identificadores y construir matrices |
+| 2\. Partición y preparación | 15 | Separar, imputar, escalar y explorar estructura |
+| 3\. Modelos y fusión | 15 | Ajustar modelos unimodales, early y late fusion |
+| 4\. Evaluación | 15 | Interpretar probabilidades, ROC, AP y Brier |
+| 5\. Comparación | 15 | Bootstrap pareado y discusión de generalización |
+
+**Antes de empezar:** descomprimir el ZIP completo, abrir este archivo en RStudio y ejecutar los chunks desde arriba o seleccionar Knit. Los CSV deben estar en la carpeta `datos/` junto al Rmd. Solo el renderizado HTML requiere `knitr`, `rmarkdown` y Pandoc; el cálculo utiliza R base. Para instalar los dos paquetes, si faltan: `install.packages(c("knitr", "rmarkdown"))`. No se requieren archivos de funciones adicionales.
+
+# De los archivos a los pacientes (15 min)
+
+## ¿Qué recibimos de cada modalidad?
+
+| Archivo de origen (ejemplos reales) | Representación de entrada del taller | Unidad |
+|:---|:---|:---|
+| WSI `.svs` / `.tiff` → embeddings `.h5` | `wsi_features.csv` | Una fila por paciente |
+| RNA `.fastq.gz` → conteos `.tsv` → expresión transformada | `rna_features.csv` | Una fila por paciente |
+| Metadatos clínicos `.tsv` | `clinical.csv` | Una fila por paciente |
+| Manifiesto de partición | `particion.csv` | Un paciente, una asignación |
+
+Las extensiones describen el formato, no garantizan la unidad biológica ni la calidad. Por ejemplo, un `.h5` puede contener miles de vectores de tiles o un único vector por WSI. En TCGA un identificador de caso tiene la forma `TCGA-XX-0001` (ejemplo ficticio); un identificador de muestra puede incluir `-01A` y otros campos. El código de tipo de muestra `01` corresponde a tumor sólido primario. No basta truncar todos los IDs para asumir que biopsias, regiones y tiempos son equivalentes. Primero se define qué caso/muestra es elegible, cómo se agregan múltiples láminas y qué relación biológica se acepta.
+
+## Leer y revisar antes de unir
+
+```{r lectura}
+list.files("datos")
+wsi <- read.csv("datos/wsi_features.csv", check.names = FALSE,
+                na.strings = c("", "NA"), stringsAsFactors = FALSE)
+rna <- read.csv("datos/rna_features.csv", check.names = FALSE,
+                na.strings = c("", "NA"), stringsAsFactors = FALSE)
+clin <- read.csv("datos/clinical.csv", stringsAsFactors = FALSE)
+part <- read.csv("datos/particion.csv", stringsAsFactors = FALSE)
+
+head(wsi[, 1:4], 4)
+head(rna[, 1:4], 4)
+head(clin, 4)
+str(clin)
+sapply(list(wsi = wsi, rna = rna, clin = clin, part = part), nrow)
+```
+
+**Interpretación.** Hay 320 filas en cada archivo, pero esto no demuestra que estén alineados. `patient_id` es una clave, no una variable predictora. `tss` indica procedencia ficticia A–D (Tissue Source Site), y `y` indica estadio: 0 = I–II, 1 = III–IV. `wsi_demo_XX` y `rna_demo_XX` son nombres artificiales de características; no corresponden a genes o biomarcadores específicos. RNA ya está transformado a una escala continua simulada (puede tener valores negativos). No corresponde aplicar TMM, DESeq2 o VST sobre esta matriz.
+
+## Los nombres y el orden son información
+
+```{r nombres}
+# ¿Son los mismos pacientes en ambos archivos? ¿En el mismo orden?
+setequal(wsi$patient_id, rna$patient_id)
+identical(wsi$patient_id, rna$patient_id)
+
+head(data.frame(WSI = wsi$patient_id, RNA = rna$patient_id,
+                Clinica = clin$patient_id), 8)
+sum(wsi$patient_id == rna$patient_id)
+sum(wsi$patient_id == clin$patient_id)
+
+# Ejemplo pequeño: diferencias de formato impiden un pareo literal.
+id <- c("DEMO-0001", "DEMO-0002")
+otro <- c(" demo-0001 ", "DEMO-0002")
+match(id, otro)
+match(id, toupper(trimws(otro)))
+```
+
+**Interpretación.** `setequal()` es TRUE, pero `identical()` es FALSE. Solo **1 de 320** filas coincide entre WSI y RNA por posición y **ninguna** entre WSI y clínica. `cbind()` uniría filas sin verificar su identidad; podría asociar la histología de un paciente al RNA o estadio de otro. En el ejemplo pequeño, `trimws()` y `toupper()` resuelven diferencias de escritura porque sabemos que son identificadores equivalentes; no debemos aplicar estas operaciones indiscriminadamente si cambian identificadores válidos o crean duplicados.
+
+```{r auditoria}
+auditar <- function(tabla) {
+  data.frame(filas = nrow(tabla),
+             ids_unicos = length(unique(tabla$patient_id)),
+             ids_faltantes = sum(is.na(tabla$patient_id) | tabla$patient_id == ""),
+             duplicados = sum(duplicated(tabla$patient_id)))
+}
+do.call(rbind, lapply(list(WSI = wsi, RNA = rna, Clinica = clin,
+                           Particion = part), auditar))
+setdiff(wsi$patient_id, rna$patient_id)
+setdiff(rna$patient_id, wsi$patient_id)
+setdiff(clin$patient_id, wsi$patient_id)
+
+# Microejemplo: un paciente tiene dos láminas y otro no tiene RNA.
+mini_wsi <- data.frame(patient_id = c("P01", "P01", "P02", "P03"),
+                       slide_id = c("S1", "S2", "S3", "S4"))
+mini_rna <- data.frame(patient_id = c("P01", "P02"), expression = c(2, 4))
+merge(mini_wsi, mini_rna, by = "patient_id", all.x = TRUE)
+```
+
+**Interpretación.** En el microejemplo P01 aparece dos veces porque tiene dos láminas; P03 queda sin RNA. Un `merge()` interno elimina P03 y conserva ambas filas de P01. Si ambas tablas tuvieran múltiples registros por paciente, podrían multiplicarse las filas. Esto no se soluciona eliminando duplicados al azar: hay que definir una regla de selección/agregación por paciente y estudiar a quién excluye el pareo. En nuestro análisis principal hay una sola fila por paciente y las tres modalidades están presentes, aunque algunas celdas están vacías.
+
+## Construir matrices alineadas
+
+```{r pareo}
+# Validar claves ANTES de unir.
+for (tabla in list(wsi, rna, clin, part)) {
+  stopifnot(!anyDuplicated(names(tabla)), !anyNA(tabla$patient_id),
+            all(nzchar(tabla$patient_id)), !anyDuplicated(tabla$patient_id))
+}
+
+d <- merge(wsi, rna, by = "patient_id")
+d <- merge(d, clin, by = "patient_id")
+d <- merge(d, part, by = "patient_id")
+stopifnot(nrow(d) == 320, !anyDuplicated(d$patient_id),
+          setequal(d$patient_id, clin$patient_id))
+
+# Seleccionar columnas por prefijo, no por posición.
+cols_A <- grep("^wsi_", names(d), value = TRUE)
+cols_B <- grep("^rna_", names(d), value = TRUE)
+A <- as.matrix(d[, cols_A, drop = FALSE])
+B <- as.matrix(d[, cols_B, drop = FALSE])
+rownames(A) <- rownames(B) <- d$patient_id
+y <- d$y
+names(y) <- d$patient_id
+stopifnot(is.numeric(A), is.numeric(B),
+          identical(rownames(A), rownames(B)), identical(rownames(A), names(y)),
+          setequal(unique(y), c(0, 1)))
+X <- cbind(A, B)
+list(A = dim(A), B = dim(B), X = dim(X), y = length(y))
+head(X[, c(1:2, 13:14)], 4)
+```
+
+**Interpretación.** Ahora $A\in\mathbb{R}^{320\times12}$, $B\in\mathbb{R}^{320\times20}$ y $X=[A\;B]\in\mathbb{R}^{320\times32}$. `cbind()` es correcto *después* de comprobar las identidades. No incluimos `y`, `set`, `patient_id`, `tss` ni variables que definan el estadio (TNM) dentro de X. En una cohorte real, una unión interna puede reducir n y cambiar la población de estudio; siempre informar cuántos casos quedan y por qué.
+
+# Separar y preparar las matrices (15 min)
+
+## Partición independiente
+
+Usamos la partición preestablecida del ejemplo de clase para reproducir sus métricas: 70% entrenamiento, 30% test. El test no se utiliza para escoger variables, hiperparámetros, arquitectura o umbrales. En esta cohorte cada fila es un paciente; si hubiese múltiples láminas, todos los registros de un paciente tendrían que quedar en la misma partición.
+
+```{r split}
+# Conservar el orden del manifiesto (útil para reproducir la referencia).
+tr <- match(part$patient_id[part$set == "train"], d$patient_id)
+te <- match(part$patient_id[part$set == "test"], d$patient_id)
+stopifnot(!anyNA(c(tr, te)), !anyDuplicated(c(tr, te)),
+          length(c(tr, te)) == nrow(d), length(intersect(tr, te)) == 0)
+length(tr); length(te)
+prop.table(table(d$set, y), margin = 1)
+```
+
+```{r grafico_split, fig.height=3.5}
+barplot(prop.table(table(y, d$set), margin = 2), beside = FALSE,
+        col = c("#B9CAD8", "#326BA2"), ylim = c(0, 1.05),
+        ylab = "Proporción", main = "Distribución de clases por partición",
+        legend.text = c("I–II", "III–IV"), args.legend = list(x = "topright", bty = "n"))
+```
+
+**Interpretación.** Train tiene 224 pacientes (128 tempranos, 96 avanzados) y test 96 (55 tempranos, 41 avanzados). Las proporciones son parecidas por estratificación. Eso no garantiza independencia entre centros ni ausencia de leakage. El gráfico de clases usa solo etiquetas del manifiesto ya fijo, no se reajusta el split.
+
+## Valores faltantes y escalas
+
+```{r faltantes, fig.height=3.8}
+# Explorar características usando solo entrenamiento.
+NA_A <- colSums(is.na(A[tr, , drop = FALSE]))
+NA_B <- colSums(is.na(B[tr, , drop = FALSE]))
+print(c(WSI = sum(NA_A), RNA = sum(NA_B)))
+old <- par(mfrow = c(1, 2), mar = c(6, 4, 3, 1))
+barplot(NA_A, names.arg = sub("wsi_demo_", "", names(NA_A)), las = 2,
+        col = col_wsi, main = "WSI", ylab = "Celdas faltantes")
+barplot(NA_B, names.arg = sub("rna_demo_", "", names(NA_B)), las = 2,
+        col = col_rna, main = "RNA", ylab = "Celdas faltantes")
+par(old)
+```
+
+**Interpretación.** Un `NA` no equivale a cero biológico. Imputaremos la mediana de cada variable estimada con train. Esto permite trabajar con celdas aisladas faltantes; una modalidad totalmente ausente requiere un diseño distinto (por ejemplo, un modelo unimodal de respaldo), no simplemente imputar un vector entero y asumir equivalencia.
+
+## Aprender en train, transformar test
+
+Para una variable $x_j$, reemplazamos faltantes por la mediana de entrenamiento y luego aplicamos:
+
+$$x'_{ij}=\frac{x_{ij}-\mu_{j,\mathrm{train}}}{s_{j,\mathrm{train}}}.$$
+
+Las mismas medianas, medias y desviaciones se utilizan después sobre test. Usamos desviación poblacional para igualar el escalado del ejemplo de Python de las diapositivas.
+
+```{r preprocesar}
+fit_prep <- function(M) {
+  med <- apply(M, 2, median, na.rm = TRUE)
+  stopifnot(all(is.finite(med)))
+  for (j in seq_len(ncol(M))) M[is.na(M[, j]), j] <- med[j]
+  mu <- colMeans(M)
+  s <- sqrt(colMeans(sweep(M, 2, mu, "-")^2))
+  s[s == 0] <- 1
+  list(median = med, mean = mu, sd = s, columns = colnames(M))
+}
+apply_prep <- function(M, prep) {
+  stopifnot(identical(colnames(M), prep$columns))
+  for (j in seq_len(ncol(M))) M[is.na(M[, j]), j] <- prep$median[j]
+  sweep(sweep(M, 2, prep$mean, "-"), 2, prep$sd, "/")
+}
+
+prepA <- fit_prep(A[tr, , drop = FALSE])
+prepB <- fit_prep(B[tr, , drop = FALSE])
+A_train <- apply_prep(A[tr, , drop = FALSE], prepA)
+A_test  <- apply_prep(A[te, , drop = FALSE], prepA)
+B_train <- apply_prep(B[tr, , drop = FALSE], prepB)
+B_test  <- apply_prep(B[te, , drop = FALSE], prepB)
+stopifnot(!anyNA(A_train), !anyNA(A_test), !anyNA(B_train), !anyNA(B_test))
+round(rbind(train = colMeans(A_train)[1:4], test = colMeans(A_test)[1:4]), 3)
+```
+
+```{r escalado_fig, fig.height=4}
+old <- par(mfrow = c(1, 2), mar = c(5, 4, 3, 1))
+boxplot(A[tr, 1:6], names = 1:6, col = "#B9CAD8", main = "Antes: WSI train",
+        xlab = "Característica", ylab = "Valor original")
+boxplot(A_train[, 1:6], names = 1:6, col = col_wsi, main = "Después: WSI train",
+        xlab = "Característica", ylab = "Valor estandarizado")
+abline(h = 0, lty = 2)
+par(old)
+```
+
+**Interpretación.** Las variables de train quedan centradas alrededor de cero (media, no necesariamente mediana). Test no tiene por qué quedar centrado: refleja pacientes nuevos. Si ajustamos `scale()` por separado en test, usamos información del conjunto que queremos evaluar y cambiamos el significado de las coordenadas. Escalar features tampoco equivale a normalizar tinciones o profundidad de RNA-seq, que son etapas anteriores.
+
+## PCA: ¿biología o procedencia?
+
+```{r pca, fig.height=4.5}
+pc <- prcomp(A_train, center = FALSE, scale. = FALSE)
+var_pc <- 100 * pc$sdev^2 / sum(pc$sdev^2)
+sitios <- sort(unique(d$tss[tr]))
+pal <- c("#326BA2", "#D17A35", "#208477", "#795A9B")
+plot(pc$x[, 1], pc$x[, 2], pch = 19, cex = .8,
+     col = pal[match(d$tss[tr], sitios)],
+     xlab = sprintf("PC1 (%.1f%%)", var_pc[1]),
+     ylab = sprintf("PC2 (%.1f%%)", var_pc[2]), main = "PCA WSI: entrenamiento")
+legend("topright", legend = sitios, col = pal, pch = 19, title = "TSS", bty = "n")
+```
+
+**Interpretación.** Cada punto es un paciente, cada eje una combinación lineal de las 12 características y el porcentaje indica varianza explicada. Si observamos separación por TSS, hay estructura asociada a procedencia que merece investigación. No demuestra que el TSS cause la separación ni que exista data leakage. Un modelo puede aprender atajos incluso con un split correcto. El PCA se ajustó solo con train; si se necesitara proyectar test, usaríamos `predict(pc, A_test)` sin reajustar.
+
+## ¿Qué ocurre si rompemos el pareo?
+
+```{r pareo_experimento, fig.height=4.2}
+# Exploración dentro de desarrollo: no utiliza el test principal.
+set.seed(33)
+C <- cor(A_train, B_train)
+k <- which(abs(C) == max(abs(C)), arr.ind = TRUE)[1, ]
+a <- A_train[, k[1]]; b <- B_train[, k[2]]
+b_mal <- sample(b)
+old <- par(mfrow = c(1, 2))
+plot(a, b, pch = 19, col = col_early, xlab = colnames(A_train)[k[1]],
+     ylab = colnames(B_train)[k[2]], main = sprintf("Pareado: r = %.2f", cor(a, b)))
+plot(a, b_mal, pch = 19, col = col_rna, xlab = colnames(A_train)[k[1]],
+     ylab = colnames(B_train)[k[2]], main = sprintf("Desordenado: r = %.2f", cor(a, b_mal)))
+par(old)
+```
+
+**Respuesta.** Desordenar RNA destruye la correspondencia entre casos sin cambiar las dimensiones ni la distribución marginal de RNA. La correlación puede cambiar. Seleccionamos el par más correlacionado solo como ejemplo exploratorio de desarrollo; no es un hallazgo biológico ni una prueba confirmatoria.
+
+# Entrenar los modelos (15 min)
+
+## De la ecuación a la implementación
+
+Un modelo logístico predice una probabilidad $p=\sigma(z)$, con $\sigma(z)=1/(1+e^{-z})$. Para WSI, $z=w_0+w_A^Tx_A$. Para early fusion, $z=w_0+w_A^Tx_A+w_B^Tx_B$. Los pesos se aprenden minimizando el error de predicción en train.
+
+Con pocas observaciones, regularizamos los coeficientes. Usaremos una penalización Ridge fija ($\lambda=10$) para los tres modelos. La elección se fija antes de observar el test, y replica el objetivo de la clase ($C=0.1$ en la parametrización usada por sklearn). El intercepto no se penaliza.
+
+$$\mathcal L(w)=-\sum_i[y_i\log p_i+(1-y_i)\log(1-p_i)]+\frac{\lambda}{2}\|w_{1:d}\|_2^2.$$
+
+```{r fit}
+# Implementación completa en R base; optim ajusta los pesos.
+fit_model <- function(M, labels, lambda = 10) {
+  stopifnot(nrow(M) == length(labels), setequal(unique(labels), c(0, 1)), lambda > 0)
+  prep <- fit_prep(M)
+  D <- cbind(Intercepto = 1, apply_prep(M, prep))
+  pen <- c(0, rep(lambda, ncol(D) - 1))
+  loss <- function(w) {
+    z <- drop(D %*% w)
+    # Forma numéricamente estable de la entropía cruzada.
+    sum(pmax(z, 0) + log1p(exp(-abs(z))) - labels * z) + sum(pen * w^2) / 2
+  }
+  grad <- function(w) {
+    drop(crossprod(D, plogis(drop(D %*% w)) - labels)) + pen * w
+  }
+  opt <- optim(rep(0, ncol(D)), loss, grad, method = "BFGS",
+               control = list(maxit = 2000, reltol = 1e-12))
+  stopifnot(opt$convergence == 0)
+  list(prep = prep, beta = setNames(opt$par, colnames(D)), lambda = lambda)
+}
+predict_model <- function(model, M) {
+  D <- cbind(Intercepto = 1, apply_prep(M, model$prep))
+  plogis(drop(D %*% model$beta))
+}
+```
+
+**Interpretación.** `fit_model()` aprende el preprocesamiento y los coeficientes juntos dentro de train. `predict_model()` usa esos parámetros congelados. `optim()` hace el trabajo que normalmente delegamos a una biblioteca de machine learning. `plogis()` implementa la sigmoide. Es un modelo de ML supervisado, no una red neuronal profunda. No hay que escalar dos veces: se entregan las matrices originales a estas funciones.
+
+## WSI-only y RNA-only
+
+```{r unimodal}
+mA <- fit_model(A[tr, , drop = FALSE], y[tr])
+mB <- fit_model(B[tr, , drop = FALSE], y[tr])
+pA <- predict_model(mA, A[te, , drop = FALSE])
+pB <- predict_model(mB, B[te, , drop = FALSE])
+head(round(cbind(WSI = pA, RNA = pB), 3))
+length(mA$beta); length(mB$beta)
+```
+
+**Interpretación.** Cada modelo produce una probabilidad de estadio avanzado por paciente. El WSI tiene 13 coeficientes (12 + intercepto); RNA tiene 21. Son los baselines: sin ellos no sabemos si fusionar aporta algo. Los coeficientes son asociaciones predictivas en variables estandarizadas, no efectos causales ni mecanismos biológicos.
+
+## Early fusion: combinar características
+
+```{r early}
+# X contiene ambas modalidades, alineadas por paciente.
+mE <- fit_model(X[tr, , drop = FALSE], y[tr])
+pE <- predict_model(mE, X[te, , drop = FALSE])
+length(mE$beta)
+
+# Inspeccionar pesos del modelo early; no seleccionar variables con test.
+b <- mE$beta[-1]
+ix <- order(abs(b), decreasing = TRUE)[1:8]
+old <- par(mar = c(4, 9, 3, 1))
+barplot(rev(b[ix]), horiz = TRUE, las = 1,
+        col = ifelse(grepl("^wsi_", rev(names(b[ix]))), col_wsi, col_rna),
+        xlab = "Coeficiente en escala estandarizada", main = "Early: pesos de train")
+abline(v = 0, lty = 2)
+par(old)
+```
+
+**Interpretación.** Early fusion aprende 33 coeficientes, incluyendo el intercepto. Al concatenar las dos modalidades con un predictor lineal, sus contribuciones al logit son aditivas. Un coeficiente positivo aumenta el logit a igualdad de otras variables. Su magnitud depende de la correlación, la regularización y los datos; no demuestra importancia causal. El modelo podría ignorar una modalidad si no resulta útil.
+
+## Late fusion: combinar predicciones
+
+```{r late, fig.height=4.4}
+pL <- (pA + pB) / 2
+probs <- list(WSI = pA, RNA = pB, Early = pE, Late = pL)
+head(round(as.data.frame(probs), 3))
+# Mostrar un paciente concreto (primero en el manifiesto de test).
+print(data.frame(patient_id = d$patient_id[te[1]], y = y[te[1]],
+                 WSI = pA[1], RNA = pB[1], Early = pE[1], Late = pL[1]))
+```
+
+**Interpretación.** Late fusion combina dos probabilidades con pesos fijos de 0,5. No requiere ajustar un tercer modelo; si quisiéramos aprender pesos o stacking, usaríamos predicciones de validación interna, nunca test. Early y late no son necesariamente equivalentes: en early se suman contribuciones antes de la sigmoide; en late se promedian probabilidades después de ella.
+
+# Evaluar e interpretar (15 min)
+
+## Una predicción no es todavía una decisión
+
+```{r probabilidades, fig.height=4.2}
+plot(pA, pB, pch = 19, cex = .85,
+     col = ifelse(y[te] == 1, "#C55442", "#326BA2"),
+     xlim = c(0, 1), ylim = c(0, 1), asp = 1,
+     xlab = "Probabilidad WSI", ylab = "Probabilidad RNA",
+     main = "¿Coinciden las dos modalidades?")
+abline(0, 1, lty = 2, col = "grey50")
+legend("topleft", c("Estadio I–II", "Estadio III–IV"),
+       col = c("#326BA2", "#C55442"), pch = 19, bty = "n")
+```
+
+**Interpretación.** Los puntos próximos a la diagonal representan acuerdo entre modelos; fuera de ella hay discrepancia. Los colores representan el estadio real, no una predicción. Dos modalidades pueden coincidir y equivocarse, o aportar evidencia complementaria. El desacuerdo por sí solo no demuestra complementariedad útil; necesitamos comparar el desempeño sobre los mismos pacientes.
+
+## Definir las métricas
+
+- **AUROC:** probabilidad de que un caso positivo reciba mayor score que uno negativo (empates cuentan 0,5). 0,5 representa ordenamiento aleatorio.
+- **AP (average precision):** precisión ponderada por incrementos de recall. La prevalencia es una referencia sin señal; no es el área trapezoidal PR.
+- **Brier:** media de $(y-p)^2$; menor es mejor. Evalúa la calidad global de probabilidades, no únicamente calibración.
+
+```{r metricas}
+auc <- function(labels, p) {
+  n1 <- sum(labels == 1); n0 <- sum(labels == 0)
+  if (n1 == 0 || n0 == 0) return(NA_real_)
+  (sum(rank(p, ties.method = "average")[labels == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+curve_points <- function(labels, p) {
+  o <- order(p, decreasing = TRUE)
+  scores <- p[o]; yy <- labels[o]
+  e <- which(!duplicated(scores, fromLast = TRUE))
+  tp <- cumsum(yy)[e]; fp <- cumsum(1 - yy)[e]
+  data.frame(fpr = c(0, fp / sum(1 - yy)), tpr = c(0, tp / sum(yy)),
+             precision = c(1, tp / (tp + fp)))
+}
+ap <- function(labels, p) {
+  r <- curve_points(labels, p)
+  sum(diff(r$tpr) * r$precision[-1])
+}
+metrics <- function(labels, p) {
+  c(AUROC = auc(labels, p), AP = ap(labels, p), Brier = mean((labels - p)^2))
+}
+compare <- function(labels, pred) {
+  t(vapply(pred, function(p) metrics(labels, p), numeric(3)))
+}
+res <- compare(y[te], probs)
+round(res, 3)
+mean(y[te])
+```
+
+| Modelo | AUROC esperada | AP esperada | Brier esperado |
+|:-------|---------------:|------------:|---------------:|
+| WSI    |          0,679 |       0,623 |          0,221 |
+| RNA    |          0,684 |       0,650 |          0,218 |
+| Early  |          0,770 |       0,710 |          0,191 |
+| Late   |          0,769 |       0,703 |          0,207 |
+
+**Interpretación.** En la referencia del ejemplo, early y late discriminan mejor que los unimodales. Early también tiene menor Brier. La prevalencia es 41/96 = 0,427. Las cifras de referencia se calcularon con Python sobre estos mismos archivos y un objetivo matemáticamente equivalente; no son cifras de TCGA. La comparación principal Early − RNA estaba fijada antes de ver el test. No usar esta tabla para seguir modificando el modelo y volver a evaluar sobre el mismo test.
+
+```{r roc_pr, fig.height=4.4}
+old <- par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+plot(c(0, 1), c(0, 1), type = "n", asp = 1,
+     xlab = "1 - especificidad", ylab = "Sensibilidad", main = "ROC")
+abline(0, 1, lty = 2, col = "grey60")
+for (nm in names(probs)) {
+  r <- curve_points(y[te], probs[[nm]])
+  lines(r$fpr, r$tpr, col = col_models[nm], lwd = 2)
+}
+legend("bottomright", paste(names(probs), sprintf("%.3f", res[, "AUROC"])),
+       col = col_models, lwd = 2, cex = .75, bty = "n")
+plot(c(0, 1), c(0, 1), type = "n", asp = 1,
+     xlab = "Recall", ylab = "Precisión", main = "Precision–Recall")
+abline(h = mean(y[te]), lty = 2, col = "grey60")
+for (nm in names(probs)) {
+  r <- curve_points(y[te], probs[[nm]])
+  lines(r$tpr, r$precision, col = col_models[nm], lwd = 2, type = "s")
+}
+legend("bottomleft", paste(names(probs), sprintf("%.3f", res[, "AP"])),
+       col = col_models, lwd = 2, cex = .75, bty = "n")
+par(old)
+```
+
+**Cómo leer las figuras.** En ROC, cuanto más cerca de la esquina superior izquierda, mejor discriminación; no se requiere fijar un umbral. En PR, la línea horizontal indica prevalencia: mantener alta precisión cuando aumenta recall es deseable, especialmente con clases minoritarias. Los modelos pueden cruzarse: una mayor AUROC no significa mejor sensibilidad a todos los umbrales.
+
+## Calibración: ¿son fiables las probabilidades?
+
+```{r calibration, fig.height=4.6}
+plot(c(0, 1), c(0, 1), type = "n", asp = 1,
+     xlab = "Probabilidad media predicha", ylab = "Frecuencia observada",
+     main = "Calibración descriptiva (5 grupos)")
+abline(0, 1, lty = 2, col = "grey60")
+for (nm in names(probs)) {
+  p <- probs[[nm]]
+  g <- ceiling(rank(p, ties.method = "first") / length(p) * 5)
+  lines(tapply(p, g, mean), tapply(y[te], g, mean), type = "b", pch = 19,
+        col = col_models[nm], lwd = 2)
+}
+legend("topleft", names(probs), col = col_models, lwd = 2, pch = 19, bty = "n")
+```
+
+**Interpretación.** Si un grupo tiene probabilidad media 0,7, idealmente cerca del 70% de sus pacientes tendría estadio avanzado. Por debajo de la diagonal hay sobreestimación, por encima subestimación. Con solo 96 pacientes y cinco grupos, la curva es ruidosa; no concluimos calibración clínica perfecta ni reajustamos sobre test. Discriminación y calibración son propiedades diferentes.
+
+# ¿Cuánto ganamos? (15 min)
+
+## Bootstrap pareado de pacientes
+
+Calculamos $\Delta=\mathrm{AUROC}_{Early}-\mathrm{AUROC}_{RNA}$. Ambas predicciones pertenecen a los mismos 96 casos, así que remuestreamos **pacientes**, no scores de cada modelo por separado. Estratificamos por clase para mantener ambas clases presentes. No volvemos a entrenar durante este bootstrap: cuantifica incertidumbre condicional a los modelos ya ajustados y a la población de test, asumiendo pacientes independientes.
+
+```{r bootstrap}
+delta <- auc(y[te], pE) - auc(y[te], pB)
+set.seed(2026)
+positivos <- which(y[te] == 1)
+negativos <- which(y[te] == 0)
+D <- replicate(1000, {
+  i <- c(sample(positivos, length(positivos), replace = TRUE),
+         sample(negativos, length(negativos), replace = TRUE))
+  auc(y[te][i], pE[i]) - auc(y[te][i], pB[i])
+})
+IC <- quantile(D, c(.025, .975))
+round(c(delta = delta, IC), 3)
+```
+
+```{r bootstrap_fig, fig.height=4.2}
+hist(D, breaks = 30, col = col_early, border = "white",
+     main = "Bootstrap pareado: Early - RNA",
+     xlab = expression(Delta * " AUROC"), ylab = "Frecuencia")
+abline(v = 0, lty = 2, lwd = 2, col = "grey40")
+abline(v = IC, col = "#C55442", lwd = 2)
+abline(v = delta, col = "#173E54", lwd = 2)
+legend("topright", c("Sin ganancia", "IC 95%", "Delta observado"),
+       col = c("grey40", "#C55442", "#173E54"), lty = c(2, 1, 1), lwd = 2, bty = "n")
+```
+
+**Interpretación.** La diferencia puntual esperada es +0,086; en la ejecución Python de referencia el IC fue [0,018; 0,159]. El IC generado por R puede diferir por el generador aleatorio. Si el intervalo calculado excluye cero, hay evidencia de una ganancia bajo este esquema de remuestreo; si lo incluye, no podemos excluir ausencia de mejora. No hacer una prueba t convencional sobre las 1.000 remuestras ni sobre folds solapados, porque no son observaciones independientes. El bootstrap tampoco mide la variación por reentrenar el modelo o cambiar de hospital.
+
+## Cierre: redactar una conclusión
+
+**Ejemplo de respuesta resuelta:** En esta cohorte ficticia, la integración temprana y tardía mostraron mayor discriminación que los modelos unimodales bajo la partición preestablecida. La integración temprana también presentó menor error de probabilidad (Brier). La diferencia Early − RNA fue aproximadamente 0,086 de AUROC; el intervalo bootstrap debe interpretarse con respecto a los pacientes de prueba y los modelos ya entrenados. Los resultados no demuestran utilidad clínica ni generalización a otros hospitales. Una cohorte real requeriría validación externa, análisis de procedencia, control de calidad y evaluación de sesgos.
+
+```{r guardar}
+# Resultados reproducibles: conservar el identificador de cada predicción.
+out <- data.frame(patient_id = d$patient_id[te], y = unname(y[te]),
+                  WSI = unname(pA), RNA = unname(pB), Early = unname(pE), Late = unname(pL))
+stopifnot(!anyDuplicated(out$patient_id), nrow(out) == length(te))
+dir.create("resultados", showWarnings = FALSE)
+write.csv(out, "resultados/predicciones.csv", row.names = FALSE)
+write.csv(data.frame(modelo = rownames(res), res, row.names = NULL),
+          "resultados/metricas.csv", row.names = FALSE)
+write.csv(data.frame(delta = D), "resultados/bootstrap.csv", row.names = FALSE)
+```
+
+# Anexos resueltos: para continuar después de los 75 minutos
+
+Los siguientes bloques son ejemplos adicionales ya resueltos. Se ejecutan únicamente si se activan (`eval=TRUE`) en R Markdown o manualmente. No usar sus resultados para modificar el modelo principal y reutilizar su test como si fuera independiente.
+
+## De conteos a logCPM: ejemplo de profundidad
+
+Este microejemplo es independiente de las matrices principales. CPM divide por el tamaño de biblioteca y multiplica por un millón; no corrige por sí solo todos los problemas de composición.
+
+```{r cpm, eval=FALSE}
+counts <- matrix(c(20, 999980, 200, 9999800), nrow = 2,
+                 dimnames = list(c("gen_X", "otros_genes"), c("M1", "M2")))
+counts
+cpm <- sweep(counts, 2, colSums(counts), "/") * 1e6
+cpm
+log2(cpm + 1)
+```
+
+**Respuesta.** Aunque M2 tiene diez veces más conteos de gen_X, las dos muestras tienen 20 CPM para ese gen; la profundidad total también es diez veces mayor. No confundir esto con normalización por composición (TMM/RLE) ni estandarización de features. No aplicar CPM a `rna_features.csv`, que ya contiene valores continuos simulados.
+
+## K-fold y nested cross-validation
+
+La validación cruzada interna permite usar todas las observaciones de desarrollo en evaluación rotativa. Nested CV separa la elección de hiperparámetros (inner) de la evaluación del procedimiento (outer). Aquí usamos solo los 224 pacientes de desarrollo; el test principal queda intacto.
+
+```{r nested, eval=FALSE}
+strat_folds <- function(labels, k, seed) {
+  set.seed(seed); f <- integer(length(labels))
+  for (cl in c(0, 1)) {
+    i <- which(labels == cl)
+    stopifnot(length(i) >= k)
+    f[i[sample.int(length(i))]] <- rep(seq_len(k), length.out = length(i))
+  }
+  f
+}
+outer <- strat_folds(y[tr], 5, 123)
+lambdas <- c(1, 10, 100)
+fold_results <- data.frame()
+for (k in 1:5) {
+  a <- tr[outer != k]; b <- tr[outer == k]
+  inner <- strat_folds(y[a], 3, 100 + k)
+  scores <- sapply(lambdas, function(l) {
+    mean(sapply(1:3, function(j) {
+      ii <- a[inner != j]; jj <- a[inner == j]
+      m <- fit_model(X[ii, , drop = FALSE], y[ii], l)
+      auc(y[jj], predict_model(m, X[jj, , drop = FALSE]))
+    }))
+  })
+  best <- lambdas[which.max(scores)]
+  m <- fit_model(X[a, , drop = FALSE], y[a], best)
+  fold_results <- rbind(fold_results, data.frame(fold = k, lambda = best,
+    AUROC = auc(y[b], predict_model(m, X[b, , drop = FALSE]))))
+}
+fold_results
+mean(fold_results$AUROC)
+```
+
+**Respuesta.** Cada outer fold evalúa una configuración elegida sin usar ese fold. La media resume validación interna, no externa. No aplicar `t.test()` a los folds como independientes. Para un análisis confirmatorio nuevo, fijar el protocolo usando desarrollo y reservar una prueba final intacta.
+
+## Leakage incluso sin señal biológica
+
+```{r fuga, eval=FALSE}
+# Experimento independiente: etiquetas sin relación con las 2500 variables.
+set.seed(32)
+N <- matrix(rnorm(180 * 2500), 180, 2500)
+colnames(N) <- paste0("noise_", seq_len(ncol(N)))
+labels <- rep(0:1, 90)
+set.seed(22)
+b <- c(sample(which(labels == 0), 30), sample(which(labels == 1), 30))
+a <- setdiff(seq_along(labels), b)
+select <- function(i) order(abs(drop(cor(N[i, , drop = FALSE], labels[i]))),
+                             decreasing = TRUE)[1:30]
+mal <- select(seq_len(nrow(N))) # incluye labels de test: fuga
+bien <- select(a)             # solo train
+pred <- function(j) predict_model(fit_model(N[a, j, drop = FALSE], labels[a]),
+                                  N[b, j, drop = FALSE])
+v <- c(Leakage = auc(labels[b], pred(mal)), Correcto = auc(labels[b], pred(bien)))
+print(v)
+barplot(v, ylim = c(0, 1), col = c("#C55442", col_early), ylab = "AUROC")
+abline(h = .5, lty = 2)
+```
+
+**Respuesta.** Seleccionar variables con toda la cohorte utiliza las etiquetas de test, aunque luego se haga un split correcto. Puede inflar AUROC en datos sin señal. Una única simulación puede fluctuar; la evaluación correcta tiene AUROC esperada cercana a 0,5 al repetir el experimento.
+
+## Interacciones explícitas y una red neuronal
+
+```{r interaccion, eval=FALSE}
+# Caso escalar de las diapositivas; estimación exploratoria en train.
+toy <- data.frame(y = y[tr], xA = A_train[, 1], xB = B_train[, 1])
+add <- glm(y ~ xA + xB, data = toy, family = binomial())
+inter <- glm(y ~ xA * xB, data = toy, family = binomial())
+coef(add); coef(inter)
+# xA*xB en fórmula de R expande a xA + xB + xA:xB.
+```
+
+**Respuesta.** El término $w_3 x_A x_B$ permite que el efecto en el logit de una característica dependa del valor de la otra. Concatenar con una regresión aditiva no añade automáticamente interacciones. Si se cruzan las 12 características de WSI con las 20 de RNA se generan 240 productos, aumentando considerablemente la complejidad; conviene regularizar y validar. No interpretar coeficientes como causalidad.
+
+```{r mlp, eval=FALSE}
+# Opcional: red neuronal pequeña, requiere nnet (paquete recomendado de R).
+# install.packages("nnet") si no está instalado.
+stopifnot(requireNamespace("nnet", quietly = TRUE))
+set.seed(42)
+# Crear otra partición interna de desarrollo, no usar test principal.
+val <- unlist(lapply(split(tr, y[tr]), function(i) sample(i, round(.2 * length(i)))))
+train_nn <- setdiff(tr, val)
+pr <- fit_prep(X[train_nn, , drop = FALSE])
+net <- nnet::nnet(apply_prep(X[train_nn, , drop = FALSE], pr), y[train_nn],
+                  size = 4, entropy = TRUE, decay = .1, maxit = 300, trace = FALSE)
+p_nn <- drop(predict(net, apply_prep(X[val, , drop = FALSE], pr)))
+p_lin <- predict_model(fit_model(X[train_nn, , drop = FALSE], y[train_nn]),
+                       X[val, , drop = FALSE])
+round(rbind(MLP = metrics(y[val], p_nn), Logistica = metrics(y[val], p_lin)), 3)
+```
+
+**Respuesta.** El MLP recibe 32 características, aprende 4 activaciones ocultas y una salida probabilística. Puede aprender combinaciones no lineales, pero su complejidad no garantiza una mejora en nuevos pacientes. Se compara con un baseline lineal sobre los mismos casos internos. Los resultados no son comparables directamente con las métricas del test principal porque usan otra partición.
+
+## Coordinación: CCA no es early fusion
+
+```{r cca, eval=FALSE}
+cc <- cancor(A_train, B_train)
+cc$cor[1:3]
+zA <- drop(sweep(A_train, 2, cc$xcenter, "-") %*% cc$xcoef[, 1, drop = FALSE])
+zB <- drop(sweep(B_train, 2, cc$ycenter, "-") %*% cc$ycoef[, 1, drop = FALSE])
+plot(zA, zB, pch = 19, col = col_early, xlab = "Proyección WSI",
+     ylab = "Proyección RNA", main = "CCA: correlación en desarrollo")
+```
+
+**Respuesta.** CCA encuentra proyecciones separadas que maximizan correlación entre las vistas. Esta correlación se calculó en las observaciones usadas para ajustar CCA; podría sobreestimar asociación fuera de muestra. No es una medida de predicción de estadio.
+
+## MOFA2: separar variación compartida y específica
+
+En notación con pacientes en columnas, $Y^{(m)}\approx W^{(m)}Z$, con $Y^{(m)}$: variables × pacientes, $W^{(m)}$: variables × factores y $Z$: factores × pacientes. Es no supervisado. El código de referencia requiere MOFA2 y su backend; no se instala durante el taller. Las filas de A y B son pacientes, de modo que hay que transponerlas antes de crear el objeto.
+
+```{r mofa, eval=FALSE}
+# Requiere instalación de MOFA2/Bioconductor y backend mofapy2/basilisk.
+library(MOFA2)
+views <- list(WSI = t(A[tr, , drop = FALSE]), RNA = t(B[tr, , drop = FALSE]))
+stopifnot(identical(colnames(views$WSI), colnames(views$RNA)))
+obj <- create_mofa(views)
+model_opts <- get_default_model_options(obj)
+model_opts$num_factors <- 5
+train_opts <- get_default_training_options(obj)
+train_opts$seed <- 42
+obj <- prepare_mofa(obj, model_options = model_opts, training_options = train_opts)
+obj <- run_mofa(obj, outfile = "resultados/mofa_desarrollo.hdf5", use_basilisk = TRUE)
+plot_variance_explained(obj)
+plot_factors(obj, factors = 1:2)
+```
+
+**Respuesta.** El heatmap permite identificar factores que explican variación en una o ambas vistas. Varianza explicada no equivale a AUROC ni prueba que un factor sea biológico. Este ajuste es exploratorio, no un pipeline de predicción externa. Para usar factores como predictores se necesita un mecanismo válido de inferencia de scores fuera de muestra con parámetros aprendidos solo en train.
+
+## Generalización a otro TSS
+
+```{r tss, eval=FALSE}
+# Protocolo distinto, ilustrativo, dejando D fuera de desarrollo.
+# Se usa la cohorte simulada completa para este segundo experimento;
+# no corresponde a un hospital clínico externo ni a un lockbox nuevo.
+a <- which(d$tss != "D"); b <- which(d$tss == "D")
+stopifnot(!length(intersect(d$tss[a], d$tss[b])))
+pa <- predict_model(fit_model(A[a, , drop = FALSE], y[a]), A[b, , drop = FALSE])
+pb <- predict_model(fit_model(B[a, , drop = FALSE], y[a]), B[b, , drop = FALSE])
+pe <- predict_model(fit_model(X[a, , drop = FALSE], y[a]), X[b, , drop = FALSE])
+round(compare(y[b], list(WSI = pa, RNA = pb, Early = pe, Late = (pa + pb)/2)), 3)
+```
+
+**Respuesta.** En la referencia de estos datos para TSS D las AUROC son aproximadamente 0,601 (WSI), 0,663 (RNA), 0,731 (Early), 0,707 (Late). La ganancia puede cambiar según el sitio y el conjunto de casos. Dejar un TSS fuera de una misma cohorte simula un cambio de procedencia, pero no es validación clínica externa independiente. Nunca escoger el sitio que favorece un método.
+
+# Referencias para continuar
+
+- Sesión 9, *IA multimodal en medicina de precisión*: pp. 5, 13–16 (archivos, pareo y fusión); pp. 28–38 (validación y comparación). Material de la asignatura.
+- L.-P. Morency, Carnegie Mellon University, *Multimodal Representations, Part 1*, pp. 22–29. Early/late fusion y combinación aditiva/multiplicativa.
+- B. Soltoff, Cornell University, *Use your data*, Lecture 4 (2025), pp. 18–36. Particiones, leakage, resampling y bootstrap.
+- R. O. Ramirez Flores, EMBL-EBI, *Multi-Omics Factor Analysis (MOFA)* (2026), pp. 3–14. Factores, pesos y varianza explicada.
+- Argelaguet et al. (2018). Multi-Omics Factor Analysis. *Molecular Systems Biology*, 14, e8124. <doi:10.15252/msb.20178124>.
+
+**Nota de reproducibilidad.** Los CSV, la partición y las métricas de referencia se verificaron con Python. La implementación R base usa el mismo objetivo y se revisó estáticamente; este entorno no tiene intérprete R, por lo que es necesario ejecutar los chunks en RStudio para verificar las salidas y renderizar el HTML antes de la clase. Las secciones opcionales que dependen de paquetes no se ejecutan automáticamente.
