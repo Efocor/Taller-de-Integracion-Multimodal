@@ -1,7 +1,7 @@
 # Taller-de-Integracion-Multimodal
 Seguimiento simulado para la realización de una fusión y validación de modelos
 
-TALLER 9 — Integración multimodal en R
+TALLER 9 | Integración multimodal en R (+ prácticos de extensión)
 
 1. Descomprima todo el ZIP, conservando la carpeta datos.
 2. Abra Taller_multimodal_guiado.Rmd en RStudio.
