@@ -1,0 +1,12 @@
+EXTENSIÓN MOFA2 · 20 minutos
+
+1. Descomprime el ZIP y entra en la carpeta Extension_MOFA2_lista.
+2. Desde Bash o fish, ejecuta:
+   Rscript instalar.R
+   Rscript ejecutar.R
+   El segundo comando genera MOFA2_resuelto.html (si el paquete contiene el solucionario).
+   Para el documento de ejercicios: Rscript ejecutar.R ejercicios
+3. En RStudio puedes abrir directamente MOFA2_resuelto.Rmd o MOFA2_ejercicios.Rmd y usar Knit.
+4. Los ejercicios tienen bloques TODO con eval=FALSE para que el documento inicial pueda renderizarse. Complétalos y cambia eval=FALSE a TRUE antes de volver a generar el HTML.
+5. Los cuatro CSV son copias exactas del taller anterior; se utilizan solo los 224 pacientes de train, reservando 96 de test.
+6. El primer ajuste con basilisk puede requerir internet para preparar Python. Probar antes de clase. No se incluyen resultados de MOFA2 precalculados: R no está disponible en el entorno donde se preparó este material.

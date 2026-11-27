@@ -1,0 +1,152 @@
+---
+title: "Extensión del taller: integración no supervisada con MOFA2"
+subtitle: "Sesión 9 · IA multimodal en medicina de precisión"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: show
+lang: es
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=TRUE,
+                      fig.width=7, fig.height=4, dpi=120)
+```
+
+**Duración orientativa: 20 minutos (con MOFA2 instalado).**
+
+En el taller anterior combinamos WSI y RNA para predecir estadio. Ahora cambia la pregunta: **¿qué patrones de variación explican las dos modalidades, sin utilizar la etiqueta?** Utilizaremos los mismos datos simulados: 320 pacientes, 12 características WSI y 20 RNA. Conservamos los 96 casos de test sin utilizar; el análisis exploratorio se restringe a los 224 de desarrollo. No es un nuevo experimento de predicción.
+
+Basado en el proyecto *Multi-Omics Integration for Personalised Medicine*, EMBL-EBI, curso del 3–7 de marzo de 2025, archivos `project.ipynb` y `project_solutions.ipynb` proporcionados. El original usa Python, MuData, muon y mofax sobre leucemia linfocítica crónica; aquí adaptamos solo las secciones de entrenamiento, varianza explicada, scores y pesos a MOFA2 en R y a nuestros datos WSI/RNA.
+
+## 1. Recuperar las matrices (3 min)
+
+Ejecutar desde la carpeta que contiene `datos/`. No hace falta ejecutar el taller anterior primero. Si ya tienes `A`, `B`, `d` y `tr`, este bloque reproduce su construcción. RNA está transformado; no son conteos. Las features son artificiales, sin identidad génica o histológica real.
+
+```{r datos}
+wsi <- read.csv("datos/wsi_features.csv", check.names=FALSE)
+rna <- read.csv("datos/rna_features.csv", check.names=FALSE)
+clin <- read.csv("datos/clinical.csv")
+part <- read.csv("datos/particion.csv")
+for (x in list(wsi, rna, clin, part)) {
+  stopifnot(!anyNA(x$patient_id), !anyDuplicated(x$patient_id))
+}
+d <- Reduce(function(x,y) merge(x,y,by="patient_id"),
+            list(wsi,rna,clin,part))
+stopifnot(nrow(d)==320)
+d <- d[d$set=="train", ]
+stopifnot(nrow(d)==224)
+A <- as.matrix(d[, grepl("^wsi_", names(d)), drop=FALSE])
+B <- as.matrix(d[, grepl("^rna_", names(d)), drop=FALSE])
+rownames(A) <- rownames(B) <- d$patient_id
+stopifnot(identical(rownames(A), rownames(B)))
+list(WSI=dim(A), RNA=dim(B), faltantes=c(WSI=sum(is.na(A)),RNA=sum(is.na(B))))
+```
+
+MOFA2 recibe cada vista por separado, con **variables en filas y pacientes en columnas**. Estandarizamos cada característica de desarrollo con `scale()` y mantenemos los NA: MOFA2 permite observaciones faltantes. No confundas esto con la imputación requerida por la regresión del práctico anterior.
+
+## 2. Entrenar MOFA2 (5 min)
+
+Instalación previa (una vez, no durante la sesión):
+
+```{r instalar, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+BiocManager::install("MOFA2")
+```
+
+El primer `run_mofa(..., use_basilisk=TRUE)` puede necesitar internet y preparar un entorno Python. Probar antes de clase. En cada ejecución se crea un modelo nuevo en un directorio temporal.
+
+```{r entrenar}
+if (!requireNamespace("MOFA2", quietly=TRUE)) {
+  stop("Falta MOFA2. Ejecuta Rscript instalar.R desde la terminal.")
+}
+library(MOFA2)
+views <- list(WSI=t(scale(A)), RNA=t(scale(B)))
+stopifnot(identical(colnames(views$WSI), colnames(views$RNA)))
+lapply(views, dim)
+obj <- create_mofa(views)
+model_opts <- get_default_model_options(obj)
+model_opts$num_factors <- 4
+model_opts$likelihoods[] <- "gaussian"
+train_opts <- get_default_training_options(obj)
+train_opts$seed <- 42
+obj <- prepare_mofa(obj, model_options=model_opts,
+                    training_options=train_opts)
+model <- run_mofa(obj, outfile=tempfile(fileext=".hdf5"),
+                  use_basilisk=TRUE)
+```
+
+Con $m$ como modalidad, $Y^{(m)}\approx W^{(m)}Z^T$ donde $Y$ es variables × pacientes, $W$ variables × factores y $Z$ pacientes × factores. La etiqueta `y` y TSS no intervienen en el ajuste. Cuatro es el número inicial de factores, no una verdad biológica ni una garantía de cuatro factores activos.
+
+## 3. Varianza explicada (4 min)
+
+```{r varianza}
+plot_variance_explained(model, x="view", y="factor")
+ve <- get_variance_explained(model)
+R2 <- ve$r2_per_factor[[1]]
+round(R2, 2)
+round(ve$r2_total[[1]], 2)
+```
+
+Cada celda indica el porcentaje de varianza de una vista explicado por un factor. El total se calcula conjuntamente, no hay que sumar necesariamente las celdas de una columna.
+
+**Ejercicio 1.** Identifica un factor con señal en ambas vistas y otro que explique preferentemente una. ¿La varianza explicada es una medida de capacidad predictiva? Para elegir un factor candidato a compartido, calcula el máximo de la menor varianza explicada entre sus dos vistas.
+
+```{r seleccionar}
+f <- rownames(R2)[which.max(apply(R2, 1, min))]
+f
+R2[f, , drop=FALSE]
+rownames(R2)[which.max(abs(R2[, "WSI"]-R2[, "RNA"]))]
+```
+
+**Solución.** El criterio elige el factor con mayor soporte mínimo entre vistas; inspecciona sus dos porcentajes. El segundo criterio identifica la mayor diferencia entre vistas, pero no demuestra especificidad estricta. Si todas las cifras son pequeñas, no hay evidencia clara de un factor compartido. R² describe reconstrucción de los datos, no AUROC ni capacidad predictiva. No se presupone qué número de factor resultará. \## 4. Scores: ¿qué representan los pacientes? (4 min)
+
+```{r scores}
+Z <- get_factors(model)[[1]]
+meta <- d[match(rownames(Z), d$patient_id), ]
+stopifnot(identical(rownames(Z), meta$patient_id))
+dim(Z)
+head(Z)
+```
+
+**Ejercicio 2.** Para el factor `f` elegido, construye un boxplot por TSS y otro por estadio. ¿Puede un factor compartido capturar diferencias técnicas? ¿Una diferencia por estadio demuestra causalidad o capacidad predictiva?
+
+```{r boxplots, fig.height=3.7}
+op <- par(mfrow=c(1,2), mar=c(4,4,3,1))
+boxplot(Z[,f] ~ meta$tss, xlab="TSS", ylab=f, col="#C5DFE6",
+        main="Procedencia")
+boxplot(Z[,f] ~ factor(meta$y, levels=0:1, labels=c("I-II","III-IV")),
+        xlab="Estadio", ylab=f, col="#A9D8C7", main="Estadio")
+par(op)
+```
+
+**Solución.** Compara medianas, dispersión y solapamiento. Una separación por TSS sugiere una asociación con la procedencia, pero no identifica por sí sola su causa. Una diferencia por estadio es exploratoria; no equivale a validación predictiva ni demuestra causalidad. El signo de un factor puede invertirse junto con sus pesos sin cambiar la reconstrucción. \## 5. Pesos: ¿qué variables sostienen el factor? (4 min)
+
+```{r pesos}
+W <- get_weights(model)
+lapply(W, dim)
+```
+
+**Ejercicio 3.** Ordena las características de WSI y RNA por el valor absoluto de sus pesos en `f`. Grafica las cinco más relevantes de cada vista, conservando el signo. ¿Qué significa un peso negativo cuando el score de un paciente es positivo?
+
+```{r top_pesos, fig.height=4}
+for (vista in c("WSI", "RNA")) {
+  w <- W[[vista]][, f]
+  i <- head(order(abs(w), decreasing=TRUE), 5)
+  print(w[i])
+  print(plot_top_weights(model, view=vista, factor=f, nfeatures=5))
+}
+```
+
+**Solución.** El valor absoluto del peso refleja la contribución de esa variable a ese factor. Un peso negativo y score positivo producen una contribución negativa respecto al nivel centrado de la variable; otros factores también contribuyen. Los nombres `wsi_demo_*` y `rna_demo_*` no corresponden a biomarcadores reales, de modo que no podemos asignar vías biológicas. Si fueran genes reales podríamos formular hipótesis o realizar enriquecimiento. \## Cierre
+
+**Respuesta:** Early/late fusion busca mejorar una predicción; MOFA2 permite descubrir e interpretar fuentes de variación multimodal.
+
+Para continuar (opcional): repetir el ajuste con dos factores y comparar la varianza total y los pesos. Es una comparación exploratoria, no seleccionar el modelo utilizando test.
+
+**Referencias**
+
+- EMBL-EBI (2025). *Introduction to Multi-Omics Data Integration and Visualisation*. Proyecto *Multi-Omics Integration for Personalised Medicine*, notebooks de ejercicios y soluciones (material adjunto).
+- MOFA2: [Entrenamiento en R](https://biofam.github.io/MOFA2/tutorials.html) y [análisis posterior](https://bioconductor.org/packages/release/bioc/vignettes/MOFA2/inst/doc/downstream_analysis.html).
+- Argelaguet et al. (2020). MOFA+: a statistical framework for comprehensive integration of multi-modal single-cell data. *Genome Biology*, 21, 111. <https://doi.org/10.1186/s13059-020-02015-1>
